@@ -6,7 +6,6 @@ use axum::{
     Json, Router, response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::{
     collections::HashMap,
     net::SocketAddr,
