@@ -159,7 +159,7 @@ async fn main() {
                 .into_inner()
         )
         .with_state(db)
-        .layer(axum::middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+        .layer(axum::middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next<axum::body::Body>| {
             let tel = tel_layer.clone();
             async move {
                 let method = req.method().to_string();
