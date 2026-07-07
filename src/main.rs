@@ -16,7 +16,69 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use opentelemetry::{
+    global,
+    KeyValue,
+    metrics::{Counter, Histogram, UpDownCounter},
+};
+use opentelemetry_sdk::{
+    metrics::SdkMeterProvider,
+    trace::SdkTracerProvider,
+    Resource,
+};
+use std::time::Instant;
 
+
+/// Shared telemetry instruments, cloned into each handler via AppState.
+#[derive(Clone)]
+struct Telemetry {
+    /// http.server.request.duration — latency histogram (seconds)
+    request_duration: Histogram<f64>,
+    /// http.server.request.duration count dimension — also used for availability / error-rate
+    request_counter: Counter<u64>,
+    /// active in-flight requests (UpDownCounter for saturation SLI)
+    active_requests: UpDownCounter<i64>,
+    /// flow.outcomes — e2e business flow success/failure counter
+    flow_outcomes: Counter<u64>,
+    /// flow.duration — e2e flow latency histogram (seconds)
+    flow_duration: Histogram<f64>,
+    /// flow.validation.outcomes — per-step validation pass/fail counter
+    flow_validation_outcomes: Counter<u64>,
+}
+
+impl Telemetry {
+    fn new() -> Self {
+        let meter = global::meter("axum-todo");
+        Telemetry {
+            request_duration: meter
+                .f64_histogram("http.server.request.duration")
+                .with_description("Duration of inbound HTTP requests")
+                .with_unit("s")
+                .build(),
+            request_counter: meter
+                .u64_counter("http.server.requests.total")
+                .with_description("Total number of HTTP requests")
+                .build(),
+            active_requests: meter
+                .i64_up_down_counter("http.server.active_requests")
+                .with_description("Number of in-flight HTTP requests")
+                .build(),
+            flow_outcomes: meter
+                .u64_counter("flow.outcomes")
+                .with_description("E2E business flow terminal outcomes")
+                .build(),
+            flow_duration: meter
+                .f64_histogram("flow.duration")
+                .with_description("E2E business flow duration")
+                .with_unit("s")
+                .build(),
+            flow_validation_outcomes: meter
+                .u64_counter("flow.validation.outcomes")
+                .with_description("Per-step validation pass/fail outcomes")
+                .build(),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -27,10 +89,39 @@ async fn main() {
             )
             .with(tracing_subscriber::fmt::layer())
             .init();
+
+    // --- OpenTelemetry SDK bootstrap ---
+    let resource = Resource::builder().with_service_name("axum-todo").build();
+
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .build()
+        .expect("Failed to build OTLP metric exporter");
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(metric_exporter)
+        .with_resource(resource.clone())
+        .build();
+    global::set_meter_provider(meter_provider.clone());
+
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+        .expect("Failed to build OTLP span exporter");
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_resource(resource.clone())
+        .build();
+    global::set_tracer_provider(tracer_provider.clone());
+    // --- end OTel bootstrap ---
+
+    let telemetry = Telemetry::new();
     
     // Set the the initial value of the database
     let db = Db::default();
-    
+
+    // Wrap db + telemetry into shared app state
+    let app_state = AppState { db, telemetry };
+
     // compose the routes
     let app = Router::new()
         .route("/todos", get(todos_index).post(todos_create))
@@ -52,8 +143,8 @@ async fn main() {
                 .layer(TraceLayer::new_for_http())
                 .into_inner()
         )
-        .with_state(db);
-    
+        .with_state(app_state);
+
      // add a fallback service for handling routes to unknown paths
      let app = app.fallback(handler_404);
 
@@ -66,10 +157,21 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    // Flush buffered telemetry before exit
+    meter_provider.shutdown().ok();
+    tracer_provider.shutdown().ok();
 }
 
 // set up the database
 type Db = Arc<RwLock<HashMap<Uuid, Todo>>>;
+
+/// Combined application state: in-memory DB + OTel instruments.
+#[derive(Clone)]
+struct AppState {
+    db: Db,
+    telemetry: Telemetry,
+}
 
 // struct that defines todo
 #[derive(Debug, Serialize, Clone)]
@@ -89,9 +191,12 @@ pub struct Pagination {
 // route to get all todos
 async fn todos_index(
     pagination: Option<Query<Pagination>>,
-    State(db): State<Db>
+    State(state): State<AppState>
 ) -> impl IntoResponse {
-    let todos = db.read().unwrap();
+    let start = Instant::now();
+    state.telemetry.active_requests.add(1, &[KeyValue::new("http.route", "/todos")]);
+
+    let todos = state.db.read().unwrap();
 
     let Query(pagination) = pagination.unwrap_or_default();
     
@@ -101,6 +206,17 @@ async fn todos_index(
         .take(pagination.limit.unwrap_or(usize::MAX))
         .cloned()
         .collect::<Vec<_>>();
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let attrs = [
+        KeyValue::new("http.request.method", "GET"),
+        KeyValue::new("http.route", "/todos"),
+        KeyValue::new("http.response.status_code", 200_i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    state.telemetry.request_duration.record(elapsed, &attrs);
+    state.telemetry.request_counter.add(1, &attrs);
+    state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos")]);
 
     Json(todos)
 }
@@ -112,14 +228,30 @@ struct CreateTodo{
 }
 
 // create todo route using CreateTodo struct as the body
-async fn todos_create(State(db): State<Db>, Json(input): Json<CreateTodo>) -> impl IntoResponse {
+async fn todos_create(State(state): State<AppState>, Json(input): Json<CreateTodo>) -> impl IntoResponse {
+    let start = Instant::now();
+    state.telemetry.active_requests.add(1, &[KeyValue::new("http.route", "/todos")]);
+
     let todo = Todo {
         id: Uuid::new_v4(),
         text: input.text,
         completed: false
     };
 
-    db.write().unwrap().insert(todo.id, todo.clone());
+    state.db.write().unwrap().insert(todo.id, todo.clone());
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let attrs = [
+        KeyValue::new("http.request.method", "POST"),
+        KeyValue::new("http.route", "/todos"),
+        KeyValue::new("http.response.status_code", 201_i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    state.telemetry.request_duration.record(elapsed, &attrs);
+    state.telemetry.request_counter.add(1, &attrs);
+    state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos")]);
+    // Flow entry: every POST /todos starts the primary Create-and-Complete flow
+    state.telemetry.flow_outcomes.add(1, &[KeyValue::new("outcome", "started")]);
 
     (StatusCode::CREATED, Json(todo))
 }
@@ -134,26 +266,58 @@ struct UpdateTodo {
 // update todo route using UpdateTodo struct as the body
 async fn todos_update(
     Path(id): Path<Uuid>,
-    State(db): State<Db>,
+    State(state): State<AppState>,
     Json(input): Json<UpdateTodo>
 ) -> Result<impl IntoResponse, StatusCode>
 {
-    let mut todo = db
+    let start = Instant::now();
+    state.telemetry.active_requests.add(1, &[KeyValue::new("http.route", "/todos/:id")]);
+
+    let mut todo = state.db
         .read()
         .unwrap()
         .get(&id)
         .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| {
+            let elapsed = start.elapsed().as_secs_f64();
+            let attrs = [
+                KeyValue::new("http.request.method", "PATCH"),
+                KeyValue::new("http.route", "/todos/:id"),
+                KeyValue::new("http.response.status_code", 404_i64),
+                KeyValue::new("url.scheme", "http"),
+            ];
+            state.telemetry.request_duration.record(elapsed, &attrs);
+            state.telemetry.request_counter.add(1, &attrs);
+            state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos/:id")]);
+            StatusCode::NOT_FOUND
+        })?;
 
     if let Some(text) = input.text{
         todo.text = text;
     }
 
     if let Some(completed) = input.completed{
+        // If marking completed, record flow completion
+        if completed {
+            let flow_elapsed = start.elapsed().as_secs_f64();
+            state.telemetry.flow_outcomes.add(1, &[KeyValue::new("outcome", "success")]);
+            state.telemetry.flow_duration.record(flow_elapsed, &[]);
+        }
         todo.completed = completed
     }
 
-    db.write().unwrap().insert(todo.id, todo.clone());
+    state.db.write().unwrap().insert(todo.id, todo.clone());
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let attrs = [
+        KeyValue::new("http.request.method", "PATCH"),
+        KeyValue::new("http.route", "/todos/:id"),
+        KeyValue::new("http.response.status_code", 200_i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    state.telemetry.request_duration.record(elapsed, &attrs);
+    state.telemetry.request_counter.add(1, &attrs);
+    state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos/:id")]);
 
     Ok(Json(todo))
 }
@@ -161,26 +325,68 @@ async fn todos_update(
 // route to get a particular todo
 async fn todos_get(
     Path(id): Path<Uuid>,
-    State(db): State<Db>,
+    State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode>
 {
-    let todo = db
+    let start = Instant::now();
+    state.telemetry.active_requests.add(1, &[KeyValue::new("http.route", "/todos/:id")]);
+
+    let todo = state.db
         .read()
         .unwrap()
         .get(&id)
         .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
-    
+        .ok_or_else(|| {
+            let elapsed = start.elapsed().as_secs_f64();
+            let attrs = [
+                KeyValue::new("http.request.method", "GET"),
+                KeyValue::new("http.route", "/todos/:id"),
+                KeyValue::new("http.response.status_code", 404_i64),
+                KeyValue::new("url.scheme", "http"),
+            ];
+            state.telemetry.request_duration.record(elapsed, &attrs);
+            state.telemetry.request_counter.add(1, &attrs);
+            state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos/:id")]);
+            StatusCode::NOT_FOUND
+        })?;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let attrs = [
+        KeyValue::new("http.request.method", "GET"),
+        KeyValue::new("http.route", "/todos/:id"),
+        KeyValue::new("http.response.status_code", 200_i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    state.telemetry.request_duration.record(elapsed, &attrs);
+    state.telemetry.request_counter.add(1, &attrs);
+    state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos/:id")]);
+
     Ok(Json(todo))
 }
 
 // route to delete a particular todo
-async fn todos_delete(Path(id): Path<Uuid>, State(db): State<Db>) -> impl IntoResponse {
-    if db.write().unwrap().remove(&id).is_some(){
-        StatusCode::NO_CONTENT
+async fn todos_delete(Path(id): Path<Uuid>, State(state): State<AppState>) -> impl IntoResponse {
+    let start = Instant::now();
+    state.telemetry.active_requests.add(1, &[KeyValue::new("http.route", "/todos/:id")]);
+
+    let (status_code, status_i64) = if state.db.write().unwrap().remove(&id).is_some() {
+        (StatusCode::NO_CONTENT, 204_i64)
     } else {
-        StatusCode::NOT_FOUND
-    }
+        (StatusCode::NOT_FOUND, 404_i64)
+    };
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let attrs = [
+        KeyValue::new("http.request.method", "DELETE"),
+        KeyValue::new("http.route", "/todos/:id"),
+        KeyValue::new("http.response.status_code", status_i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    state.telemetry.request_duration.record(elapsed, &attrs);
+    state.telemetry.request_counter.add(1, &attrs);
+    state.telemetry.active_requests.add(-1, &[KeyValue::new("http.route", "/todos/:id")]);
+
+    status_code
 } 
 
 
