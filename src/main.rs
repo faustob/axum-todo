@@ -97,7 +97,7 @@ fn build_telemetry() -> Telemetry {
 async fn telemetry_middleware(
     State(state): State<AppState>,
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> Response {
     let method = req.method().to_string();
     let route = req
