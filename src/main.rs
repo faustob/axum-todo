@@ -126,7 +126,7 @@ async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next<axum::b
     INSTRUMENTS.http_request_duration.record(elapsed, &attrs);
 
     let count_attrs = vec![
-        KeyValue::new("http.route", route),
+        KeyValue::new("http.route", route.clone()),
         KeyValue::new("http.request.method", method),
         KeyValue::new("outcome", outcome),
         KeyValue::new("http.response.status_code", status as i64),
