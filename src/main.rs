@@ -107,7 +107,7 @@ fn init_metrics() -> Metrics {
 async fn telemetry_middleware(
     axum::Extension(metrics): axum::Extension<Arc<Metrics>>,
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> Response {
     let method = req.method().to_string();
     let route = req
