@@ -145,7 +145,7 @@ async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next
     worker_pool_gauge.record(WORKER_POOL_SIZE, &[]);
 
     let tracer = global::tracer("axum-todo");
-    let span = tracer.start(format!("{} {}", method, route));
+    let mut span = tracer.start(format!("{} {}", method, route));
     let start = Instant::now();
 
     let response = next.run(req).await;
