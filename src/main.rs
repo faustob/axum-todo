@@ -21,7 +21,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use opentelemetry::{global, KeyValue};
-use opentelemetry::trace::{Tracer, Status};
+use opentelemetry::trace::{Tracer, Status, Span};
 use opentelemetry_sdk::Resource;
 
 const WORKER_POOL_SIZE: i64 = 512;
@@ -123,7 +123,7 @@ async fn main() {
 
 // Middleware that emits http.server.request.duration histogram, request outcome counter,
 // active-request / worker-pool-size gauges, and a slow-request span event for P99 breaches.
-async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> Response {
     let meter = global::meter("axum-todo");
     let duration_histogram = meter
         .f64_histogram("http.server.request.duration")
