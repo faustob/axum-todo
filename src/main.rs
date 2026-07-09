@@ -39,9 +39,7 @@ fn init_otel() -> Result<(SdkMeterProvider, SdkTracerProvider), Box<dyn std::err
         .with_periodic_exporter(metric_exporter)
         .with_resource(resource.clone())
         .build();
-    if global::set_meter_provider(meter_provider.clone()).is_err() {
-        tracing::warn!("a global meter provider was already set; continuing with existing provider");
-    }
+    global::set_meter_provider(meter_provider.clone());
 
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -58,7 +56,7 @@ fn init_otel() -> Result<(SdkMeterProvider, SdkTracerProvider), Box<dyn std::err
 async fn telemetry_middleware(
     matched_path: Option<MatchedPath>,
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> Response {
     let meter = global::meter("axum-todo");
     let request_duration = meter
