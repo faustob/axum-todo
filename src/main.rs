@@ -160,7 +160,7 @@ async fn main() {
 // - slow-request span event for the P99 SLI
 async fn otel_http_metrics_middleware(
     req: Request<axum::body::Body>,
-    next: axum::middleware::Next,
+    next: axum::middleware::Next<axum::body::Body>,
 ) -> impl IntoResponse {
     let inst = instruments();
     let duration_histogram = &inst.http_duration_histogram;
