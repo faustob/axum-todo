@@ -82,7 +82,7 @@ static TELEMETRY: Lazy<Telemetry> = Lazy::new(|| {
 
 // middleware that records http.server.request.duration, outcome counters,
 // active-request/worker-pool gauges, and slow-request span events
-async fn telemetry_middleware(req: Request<Body>, next: Next) -> Response {
+async fn telemetry_middleware(req: Request<Body>, next: Next<Body>) -> Response {
     let method = req.method().to_string();
     let route = req
         .extensions()
