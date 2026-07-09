@@ -89,6 +89,24 @@ async fn main() {
         .with_description("Count of Create-and-Complete flow terminal outcomes")
         .build();
 
+    #[derive(Clone)]
+    struct AppState {
+        db: Db,
+        metrics: Arc<HttpMetrics>,
+    }
+
+    impl axum::extract::FromRef<AppState> for Db {
+        fn from_ref(state: &AppState) -> Db {
+            state.db.clone()
+        }
+    }
+
+    impl axum::extract::FromRef<AppState> for Arc<HttpMetrics> {
+        fn from_ref(state: &AppState) -> Arc<HttpMetrics> {
+            state.metrics.clone()
+        }
+    }
+
     let http_metrics = Arc::new(HttpMetrics {
         request_duration: meter
             .f64_histogram("http.server.request.duration")
@@ -106,6 +124,11 @@ async fn main() {
         flow_outcome_counter: flow_outcome_counter.clone(),
     });
     
+    let app_state = AppState {
+        db: db.clone(),
+        metrics: http_metrics.clone(),
+    };
+
     // compose the routes
     let app = Router::new()
         .route("/todos", get(todos_index).post(todos_create))
@@ -128,7 +151,7 @@ async fn main() {
                 .into_inner()
         )
         .layer(middleware::from_fn_with_state(http_metrics.clone(), http_metrics_middleware))
-        .with_state(db);
+        .with_state(app_state);
     
      // add a fallback service for handling routes to unknown paths
      let app = app.fallback(handler_404);
