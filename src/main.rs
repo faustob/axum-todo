@@ -102,7 +102,7 @@ fn build_metrics() -> Metrics {
     }
 }
 
-async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> Response {
     let metrics: Option<Arc<Metrics>> = req.extensions().get::<Arc<Metrics>>().cloned();
 
     let method = req.method().to_string();
