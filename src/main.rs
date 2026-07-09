@@ -120,7 +120,7 @@ async fn main() {
 
 // Middleware implementing SLIs: http.server.request.duration (availability, latency p95/p99,
 // error-rate, request-rate), active-request gauge for saturation, and slow-request span events.
-async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> impl IntoResponse {
     let meter = global::meter("axum-todo");
     let duration_histogram = meter
         .f64_histogram("http.server.request.duration")
