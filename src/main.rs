@@ -113,7 +113,7 @@ fn init_telemetry() -> Telemetry {
     }
 }
 
-async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> Response {
     let telemetry = global::meter("axum-todo");
     let _ = &telemetry;
 
