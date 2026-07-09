@@ -89,7 +89,7 @@ static FLOW_ENTRIES_TOTAL: AtomicI64 = AtomicI64::new(0);
 
 // HTTP telemetry middleware: records request duration, outcome counters, active requests,
 // and P99 slow-request span events using axum's route matching for a low-cardinality label.
-async fn otel_http_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+async fn otel_http_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> Response {
     let method = req.method().to_string();
     let route = req
         .extensions()
