@@ -1,7 +1,9 @@
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{MatchedPath, Path, Query, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, patch},
     Json, Router, response::IntoResponse,
 };
@@ -9,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, Instant},
 };
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use opentelemetry::{global, metrics::{Counter, Gauge, Histogram}, KeyValue};
 
 
 #[tokio::main]
