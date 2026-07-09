@@ -187,7 +187,7 @@ struct HttpMetrics {
 async fn http_metrics_middleware(
     State(metrics): State<Arc<HttpMetrics>>,
     req: Request<axum::body::Body>,
-    next: Next<axum::body::Body>,
+    next: Next,
 ) -> Response {
     let method = req.method().to_string();
     let route = req
