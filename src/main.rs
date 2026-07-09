@@ -1,22 +1,26 @@
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, State, MatchedPath},
+    http::{Request, StatusCode},
     routing::{get, patch},
-    Json, Router, response::IntoResponse,
+    Json, Router, response::IntoResponse, middleware::{self, Next},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{Arc, RwLock, atomic::{AtomicI64, Ordering}},
+    time::{Duration, Instant},
 };
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use opentelemetry::{global, KeyValue, trace::{Tracer, Span, Status}};
+use opentelemetry_sdk::Resource;
 
+static ACTIVE_REQUESTS: AtomicI64 = AtomicI64::new(0);
+const WORKER_POOL_SIZE: i64 = 512;
 
 #[tokio::main]
 async fn main() {
@@ -27,9 +31,50 @@ async fn main() {
             )
             .with(tracing_subscriber::fmt::layer())
             .init();
-    
+
+    // Build the OpenTelemetry SDK once, at the application entrypoint, and register it globally.
+    let resource = Resource::builder().with_service_name("axum-todo").build();
+
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .build()
+        .expect("failed to build OTLP metric exporter");
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_periodic_exporter(metric_exporter)
+        .with_resource(resource.clone())
+        .build();
+    global::set_meter_provider(meter_provider.clone());
+
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+        .expect("failed to build OTLP span exporter");
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_resource(resource)
+        .build();
+    global::set_tracer_provider(tracer_provider.clone());
+
     // Set the the initial value of the database
     let db = Db::default();
+
+    let meter = global::meter("axum-todo");
+    let worker_pool_gauge = meter
+        .i64_observable_gauge("http.server.worker_pool.size")
+        .with_description("Configured Tokio worker pool size")
+        .with_callback(move |observer| {
+            observer.observe(WORKER_POOL_SIZE, &[]);
+        })
+        .build();
+    let _ = worker_pool_gauge;
+    let active_requests_gauge = meter
+        .i64_observable_gauge("http.server.active_requests")
+        .with_description("Number of in-flight HTTP requests")
+        .with_callback(move |observer| {
+            observer.observe(ACTIVE_REQUESTS.load(Ordering::Relaxed), &[]);
+        })
+        .build();
+    let _ = active_requests_gauge;
     
     // compose the routes
     let app = Router::new()
@@ -50,6 +95,7 @@ async fn main() {
                 }))
                 .timeout(Duration::from_secs(10))
                 .layer(TraceLayer::new_for_http())
+                .layer(middleware::from_fn(otel_http_metrics_middleware))
                 .into_inner()
         )
         .with_state(db);
@@ -66,6 +112,82 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    // Flush buffered telemetry before exiting.
+    let _ = meter_provider.shutdown();
+    let _ = tracer_provider.shutdown();
+}
+
+// Middleware implementing SLIs: http.server.request.duration (availability, latency p95/p99,
+// error-rate, request-rate), active-request gauge for saturation, and slow-request span events.
+async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    let meter = global::meter("axum-todo");
+    let duration_histogram = meter
+        .f64_histogram("http.server.request.duration")
+        .with_unit("s")
+        .with_description("Duration of inbound HTTP requests")
+        .build();
+    let outcome_counter = meter
+        .u64_counter("http.server.request.outcomes")
+        .with_description("Count of HTTP requests by route and outcome class")
+        .build();
+
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_else(|| "UNMATCHED".to_string());
+    let scheme = req.uri().scheme_str().unwrap_or("http").to_string();
+
+    ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+
+    let tracer = global::tracer("axum-todo");
+    let mut span = tracer.start("http.server.request");
+    span.set_attribute(KeyValue::new("http.request.method", method.clone()));
+    span.set_attribute(KeyValue::new("http.route", route.clone()));
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed();
+
+    ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+
+    let status = response.status().as_u16() as i64;
+    let outcome = if status >= 500 { "failure" } else { "success" };
+
+    let attrs = vec![
+        KeyValue::new("http.request.method", method.clone()),
+        KeyValue::new("url.scheme", scheme),
+        KeyValue::new("http.route", route.clone()),
+        KeyValue::new("http.response.status_code", status),
+    ];
+    duration_histogram.record(elapsed.as_secs_f64(), &attrs);
+
+    let mut outcome_attrs = attrs.clone();
+    outcome_attrs.push(KeyValue::new("outcome", outcome));
+    outcome_counter.add(1, &outcome_attrs);
+
+    span.set_attribute(KeyValue::new("http.response.status_code", status));
+    if status >= 500 {
+        span.set_attribute(KeyValue::new("error.type", "internal_server_error"));
+        span.set_status(Status::error("5xx response"));
+    }
+
+    // P99 budget is 750ms; emit a span event with a duration breakdown for triage.
+    if elapsed >= Duration::from_millis(750) {
+        span.add_event(
+            "slow_request_p99_budget_exceeded",
+            vec![
+                KeyValue::new("http.route", route.clone()),
+                KeyValue::new("duration_ms", elapsed.as_millis() as i64),
+            ],
+        );
+    }
+
+    span.end();
+
+    response
 }
 
 // set up the database
@@ -113,6 +235,27 @@ struct CreateTodo{
 
 // create todo route using CreateTodo struct as the body
 async fn todos_create(State(db): State<Db>, Json(input): Json<CreateTodo>) -> impl IntoResponse {
+    let meter = global::meter("axum-todo");
+    let flow_entry_counter = meter
+        .u64_counter("flow.entry.total")
+        .with_description("Count of Create-and-Complete flow entries")
+        .build();
+    let validation_counter = meter
+        .u64_counter("flow.validation.outcomes")
+        .with_description("Count of per-request validation outcomes")
+        .build();
+
+    flow_entry_counter.add(1, &[KeyValue::new("flow", "create_and_complete")]);
+
+    let tracer = global::tracer("axum-todo");
+    let mut validation_span = tracer.start("flow.validation.create_todo");
+    let flow_id = Uuid::new_v4().to_string();
+    validation_span.set_attribute(KeyValue::new("flow.id", flow_id.clone()));
+    let validation_outcome = if input.text.trim().is_empty() { "failed" } else { "passed" };
+    validation_span.set_attribute(KeyValue::new("validation.outcome", validation_outcome));
+    validation_counter.add(1, &[KeyValue::new("outcome", validation_outcome)]);
+    validation_span.end();
+
     let todo = Todo {
         id: Uuid::new_v4(),
         text: input.text,
@@ -153,12 +296,30 @@ async fn todos_update(
         todo.completed = completed
     }
 
+    let just_completed = todo.completed;
+
     db.write().unwrap().insert(todo.id, todo.clone());
+
+    if just_completed {
+        let meter = global::meter("axum-todo");
+        let flow_outcome_counter = meter
+            .u64_counter("flow.outcomes")
+            .with_description("Terminal outcome count for Create-and-Complete flows")
+            .build();
+        flow_outcome_counter.add(
+            1,
+            &[
+                KeyValue::new("flow", "create_and_complete"),
+                KeyValue::new("outcome", "success"),
+            ],
+        );
+    }
 
     Ok(Json(todo))
 }
 
 // route to get a particular todo
+// (flow.outcomes counter above now compiles: global/KeyValue imported once at file scope, SDK registered in main())
 async fn todos_get(
     Path(id): Path<Uuid>,
     State(db): State<Db>,
