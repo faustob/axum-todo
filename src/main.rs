@@ -176,9 +176,7 @@ async fn main() {
         .with_periodic_exporter(metric_exporter)
         .with_resource(resource.clone())
         .build();
-    if let Err(e) = std::panic::catch_unwind(|| global::set_meter_provider(meter_provider.clone())) {
-        tracing::warn!("meter provider already registered (agent present?): {:?}", e);
-    }
+    global::set_meter_provider(meter_provider.clone());
 
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -188,9 +186,7 @@ async fn main() {
         .with_batch_exporter(span_exporter)
         .with_resource(resource)
         .build();
-    if let Err(e) = std::panic::catch_unwind(|| global::set_tracer_provider(tracer_provider.clone())) {
-        tracing::warn!("tracer provider already registered (agent present?): {:?}", e);
-    }
+    global::set_tracer_provider(tracer_provider.clone());
 
     telemetry().worker_pool_gauge.record(WORKER_POOL_SIZE, &[]);
 
