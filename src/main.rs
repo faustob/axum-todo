@@ -91,7 +91,7 @@ fn telemetry() -> &'static Telemetry {
 
 async fn otel_http_metrics_middleware(
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> impl IntoResponse {
     let t = telemetry();
     let method = req.method().to_string();
