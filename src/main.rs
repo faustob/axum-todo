@@ -92,7 +92,7 @@ static INSTRUMENTS: Lazy<Instruments> = Lazy::new(|| {
     }
 });
 
-async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+async fn telemetry_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> Response {
     let method = req.method().to_string();
     let route = req
         .extensions()
