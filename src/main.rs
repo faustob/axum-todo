@@ -22,6 +22,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use opentelemetry::{global, metrics::{Counter, Gauge, Histogram}, KeyValue};
+mod telemetry;
 
 
 #[tokio::main]
@@ -34,13 +35,20 @@ async fn main() {
             .with(tracing_subscriber::fmt::layer())
             .init();
     
+    // Initialize the OpenTelemetry SDK and register it globally; keep the guard so we can
+    // flush and shut it down cleanly before the process exits.
+    let otel_guard = telemetry::init_otel().expect("failed to initialize OpenTelemetry");
+
     // Set the the initial value of the database
     let db = Db::default();
-    
+
+    let http_telemetry = HttpTelemetry::new();
+
     // compose the routes
     let app = Router::new()
         .route("/todos", get(todos_index).post(todos_create))
         .route("/todos/:id", patch(todos_update).delete(todos_delete).get(todos_get))
+        .layer(middleware::from_fn_with_state(http_telemetry, http_telemetry_middleware))
         // Add middleware to all routes
         .layer(
             ServiceBuilder::new()
@@ -73,8 +81,7 @@ async fn main() {
         .await
         .unwrap();
 
-    meter_provider.shutdown().expect("failed to shutdown meter provider");
-    tracer_provider.shutdown().expect("failed to shutdown tracer provider");
+    otel_guard.shutdown();
 }
 
 // Shared HTTP telemetry instruments, cloneable for use across middleware and handlers
@@ -127,7 +134,7 @@ impl HttpTelemetry {
 async fn http_telemetry_middleware(
     State(telemetry): State<HttpTelemetry>,
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> Response {
     let method = req.method().to_string();
     let route = req
