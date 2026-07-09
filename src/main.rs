@@ -1,7 +1,9 @@
 use axum::{
     error_handling::HandleErrorLayer,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{MatchedPath, Path, Query, State},
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, patch},
     Json, Router, response::IntoResponse,
 };
@@ -9,17 +11,147 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, Instant},
 };
 use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
+use once_cell::sync::Lazy;
+use opentelemetry::{global, trace::Tracer, KeyValue};
+mod telemetry;
+use opentelemetry::trace::{Span, Status};
+use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
+
+const WORKER_POOL_SIZE: i64 = 512;
+static ACTIVE_REQUESTS: AtomicI64 = AtomicI64::new(0);
+
+struct HttpMetrics {
+    request_duration: Histogram<f64>,
+    request_outcomes: Counter<u64>,
+    active_requests: UpDownCounter<i64>,
+    flow_entries: Counter<u64>,
+    flow_outcomes: Counter<u64>,
+    flow_duration: Histogram<f64>,
+    validation_outcomes: Counter<u64>,
+    auth_attempts: Counter<u64>,
+}
+
+static HTTP_METRICS: Lazy<HttpMetrics> = Lazy::new(|| {
+    let meter = global::meter("axum-todo");
+    HttpMetrics {
+        request_duration: meter
+            .f64_histogram("http.server.request.duration")
+            .with_unit("s")
+            .with_description("Duration of inbound HTTP requests")
+            .build(),
+        request_outcomes: meter
+            .u64_counter("http.server.request.outcomes")
+            .with_description("Count of HTTP requests by route and outcome class")
+            .build(),
+        active_requests: meter
+            .i64_up_down_counter("http.server.active_requests")
+            .with_description("Number of in-flight HTTP requests")
+            .build(),
+        flow_entries: meter
+            .u64_counter("flow.entries")
+            .with_description("Count of Create-and-Complete flow entries")
+            .build(),
+        flow_outcomes: meter
+            .u64_counter("flow.outcomes")
+            .with_description("Count of Create-and-Complete flow terminal outcomes")
+            .build(),
+        flow_duration: meter
+            .f64_histogram("flow.duration")
+            .with_unit("s")
+            .with_description("End to end duration of the Create-and-Complete flow")
+            .build(),
+        validation_outcomes: meter
+            .u64_counter("flow.validation.outcomes")
+            .with_description("Count of per-request validation outcomes")
+            .build(),
+        auth_attempts: meter
+            .u64_counter("auth.attempts")
+            .with_description("Count of authentication/authorization decisions")
+            .build(),
+    }
+});
+
+async fn otel_http_metrics_middleware(req: Request<axum::body::Body>, next: Next) -> Response {
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    ACTIVE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    HTTP_METRICS.active_requests.add(1, &[]);
+
+    let tracer = global::tracer("axum-todo");
+    let mut span = tracer.start(format!("{} {}", method, route));
+    span.set_attribute(KeyValue::new("http.request.method", method.clone()));
+    span.set_attribute(KeyValue::new("http.route", route.clone()));
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+
+    ACTIVE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+    HTTP_METRICS.active_requests.add(-1, &[]);
+
+    let status = response.status().as_u16();
+    let outcome = if status >= 500 { "error" } else { "success" };
+
+    let attrs = vec![
+        KeyValue::new("http.request.method", method.clone()),
+        KeyValue::new("http.route", route.clone()),
+        KeyValue::new("http.response.status_code", status as i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    HTTP_METRICS.request_duration.record(elapsed_secs, &attrs);
+
+    HTTP_METRICS.request_outcomes.add(
+        1,
+        &[
+            KeyValue::new("http.route", route.clone()),
+            KeyValue::new("outcome", outcome),
+            KeyValue::new("http.response.status_code", status as i64),
+        ],
+    );
+
+    span.set_attribute(KeyValue::new("http.response.status_code", status as i64));
+    if status >= 500 {
+        span.set_attribute(KeyValue::new("error.type", format!("http_{}", status)));
+        span.set_status(Status::error(format!("http_{}", status)));
+    }
+
+    // P99 budget triage: emit a span event when the handler exceeds the 750ms budget.
+    if elapsed >= Duration::from_millis(750) {
+        span.add_event(
+            "slow_request_p99_budget_exceeded",
+            vec![
+                KeyValue::new("http.route", route.clone()),
+                KeyValue::new("duration_ms", elapsed.as_millis() as i64),
+            ],
+        );
+    }
+
+    span.end();
+
+    response
+}
 
 
 #[tokio::main]
 async fn main() {
+    let otel = telemetry::init_otel("axum-todo");
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -52,6 +184,7 @@ async fn main() {
                 .layer(TraceLayer::new_for_http())
                 .into_inner()
         )
+        .route_layer(middleware::from_fn(otel_http_metrics_middleware))
         .with_state(db);
     
      // add a fallback service for handling routes to unknown paths
@@ -66,6 +199,8 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    otel.shutdown();
 }
 
 // set up the database
