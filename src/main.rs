@@ -5,7 +5,8 @@ use axum::{
     routing::{get, patch},
     Json, Router, response::IntoResponse,
     middleware::{self, Next},
-    extract::Request,
+    body::Body,
+    http::Request,
     response::Response,
 };
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-use opentelemetry::{global, KeyValue, trace::Tracer};
+use opentelemetry::{global, KeyValue, trace::{Tracer, TraceContextExt}};
 use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource};
 use once_cell::sync::Lazy;
 
@@ -81,7 +82,7 @@ static TELEMETRY: Lazy<Telemetry> = Lazy::new(|| {
 
 // middleware that records http.server.request.duration, outcome counters,
 // active-request/worker-pool gauges, and slow-request span events
-async fn telemetry_middleware(req: Request, next: Next) -> Response {
+async fn telemetry_middleware(req: Request<Body>, next: Next) -> Response {
     let method = req.method().to_string();
     let route = req
         .extensions()
@@ -189,7 +190,7 @@ async fn main() {
     let app = Router::new()
         .route("/todos", get(todos_index).post(todos_create))
         .route("/todos/:id", patch(todos_update).delete(todos_delete).get(todos_get))
-        .route_layer(middleware::from_fn(telemetry_middleware))
+        .layer(middleware::from_fn(telemetry_middleware))
         // Add middleware to all routes
         .layer(
             ServiceBuilder::new()
