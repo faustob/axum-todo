@@ -21,7 +21,7 @@ use tower::{BoxError, ServiceBuilder};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
-use opentelemetry::{global, KeyValue, trace::{Tracer, Status}};
+use opentelemetry::{global, KeyValue, trace::{Tracer, Status, Span}};
 use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider, Resource};
 
 // number of Tokio worker threads configured for the runtime; used for saturation gauge
@@ -56,7 +56,7 @@ fn init_otel() -> (SdkMeterProvider, SdkTracerProvider) {
 }
 
 // middleware that records http.server.request.duration and related SLIs
-async fn otel_http_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+async fn otel_http_middleware(req: Request<axum::body::Body>, next: Next<axum::body::Body>) -> impl IntoResponse {
     let method = req.method().to_string();
     let matched_path = req
         .extensions()
