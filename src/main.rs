@@ -56,7 +56,7 @@ fn http_metrics() -> &'static HttpMetrics {
 async fn otel_http_metrics_middleware(
     matched_path: Option<MatchedPath>,
     req: Request<axum::body::Body>,
-    next: Next,
+    next: Next<axum::body::Body>,
 ) -> impl IntoResponse {
     let method = req.method().to_string();
     let route = matched_path
