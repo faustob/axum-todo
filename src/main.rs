@@ -66,6 +66,107 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    meter_provider.shutdown().expect("failed to shutdown meter provider");
+    tracer_provider.shutdown().expect("failed to shutdown tracer provider");
+}
+
+// Shared HTTP telemetry instruments, cloneable for use across middleware and handlers
+#[derive(Clone)]
+struct HttpTelemetry {
+    request_duration: Histogram<f64>,
+    request_outcomes: Counter<u64>,
+    active_requests: Arc<AtomicI64>,
+    active_requests_gauge: Gauge<u64>,
+    worker_pool_size_gauge: Gauge<u64>,
+    worker_pool_size: u64,
+}
+
+impl HttpTelemetry {
+    fn new() -> Self {
+        let meter = global::meter("axum-todo");
+        let request_duration = meter
+            .f64_histogram("http.server.request.duration")
+            .with_unit("s")
+            .with_description("Duration of inbound HTTP requests")
+            .build();
+        let request_outcomes = meter
+            .u64_counter("http.server.request.outcomes")
+            .with_description("Count of HTTP requests by route and outcome class")
+            .build();
+        let active_requests_gauge = meter
+            .u64_gauge("http.server.active_requests")
+            .with_description("Number of in-flight HTTP requests")
+            .build();
+        let worker_pool_size_gauge = meter
+            .u64_gauge("http.server.worker_pool.size")
+            .with_description("Configured size of the Tokio worker pool")
+            .build();
+        let worker_pool_size = std::thread::available_parallelism()
+            .map(|n| n.get() as u64)
+            .unwrap_or(1);
+
+        Self {
+            request_duration,
+            request_outcomes,
+            active_requests: Arc::new(AtomicI64::new(0)),
+            active_requests_gauge,
+            worker_pool_size_gauge,
+            worker_pool_size,
+        }
+    }
+}
+
+// Middleware recording http.server.request.duration, outcome counters, and active-request gauges
+async fn http_telemetry_middleware(
+    State(telemetry): State<HttpTelemetry>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let in_flight = telemetry.active_requests.fetch_add(1, Ordering::SeqCst) + 1;
+    telemetry
+        .active_requests_gauge
+        .record(in_flight.max(0) as u64, &[]);
+    telemetry
+        .worker_pool_size_gauge
+        .record(telemetry.worker_pool_size, &[]);
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    telemetry.active_requests.fetch_sub(1, Ordering::SeqCst);
+
+    let status = response.status().as_u16();
+    let outcome = if status >= 500 { "failure" } else { "success" };
+
+    let attrs = [
+        KeyValue::new("http.request.method", method.clone()),
+        KeyValue::new("http.route", route.clone()),
+        KeyValue::new("http.response.status_code", status as i64),
+        KeyValue::new("url.scheme", "http"),
+    ];
+    telemetry.request_duration.record(elapsed, &attrs);
+
+    let outcome_attrs = [
+        KeyValue::new("http.request.method", method),
+        KeyValue::new("http.route", route),
+        KeyValue::new("outcome", outcome),
+    ];
+    telemetry.request_outcomes.add(1, &outcome_attrs);
+
+    if status >= 500 {
+        tracing::Span::current().record("error.type", "server_error");
+    }
+
+    response
 }
 
 // set up the database
