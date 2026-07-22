@@ -22,8 +22,8 @@ mod telemetry;
 
 #[tokio::main]
 async fn main() {
-    // OpenTelemetry OTLP tracing (0.26-era pipeline API).
-    let _provider = telemetry::init_tracer();
+    // OpenTelemetry OTLP tracing (0.31 builder API).
+    let provider = telemetry::init_tracer();
 
     tracing_subscriber::registry()
         .with(
@@ -72,7 +72,7 @@ async fn main() {
         .await
         .unwrap();
 
-    telemetry::shutdown();
+    telemetry::shutdown(&provider);
 }
 
 // set up the database
