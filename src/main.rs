@@ -17,9 +17,14 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
+mod telemetry;
+
 
 #[tokio::main]
 async fn main() {
+    // OpenTelemetry OTLP tracing (0.26-era pipeline API).
+    let _tracer = telemetry::init_tracer();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -66,6 +71,8 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    telemetry::shutdown();
 }
 
 // set up the database
