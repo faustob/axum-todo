@@ -3,7 +3,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
 
 /// Initialize the OTLP tracing pipeline (OpenTelemetry 0.26-era API).
-pub fn init_tracer() -> sdktrace::Tracer {
+pub fn init_tracer() -> sdktrace::TracerProvider {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4317".to_string());
     opentelemetry_otlp::new_pipeline()
